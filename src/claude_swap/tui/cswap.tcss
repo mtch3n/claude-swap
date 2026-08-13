@@ -104,6 +104,22 @@ MenuItem Static.menu-item-muted { color: $secondary; }
     color: $background;
 }
 
+#service-badge {
+    width: auto;
+    text-style: bold;
+    margin-left: 1;
+}
+
+#service-badge.service-on {
+    background: $success;
+    color: $background;
+}
+
+#service-badge.service-off {
+    background: $panel;
+    color: $text-muted;
+}
+
 #auto-summary {
     width: 1fr;
     color: $secondary;

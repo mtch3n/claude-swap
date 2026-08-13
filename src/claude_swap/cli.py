@@ -674,7 +674,11 @@ Defaults live in settings.json in the backup root; flags override them.
 
     from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent
     from claude_swap.printer import accent, yellowed
-    from claude_swap.settings import load_settings, merged_with_cli
+    from claude_swap.settings import (
+        load_notification_settings,
+        load_settings,
+        merged_with_cli,
+    )
 
     def jsonl_emit(event: AutoSwitchEvent) -> None:
         print(json.dumps(event.to_json()), flush=True)
@@ -698,10 +702,25 @@ Defaults live in settings.json in the backup root; flags override them.
                 sys.exit(1)
 
         settings = merged_with_cli(load_settings(switcher.backup_dir), args)
+
+        emit = jsonl_emit if args.json else human_emit
+        if load_notification_settings(switcher.backup_dir).enabled:
+            from claude_swap.notify import DesktopNotifier
+
+            notifier = DesktopNotifier()
+            write_line = emit
+
+            def emit(event: AutoSwitchEvent) -> None:
+                # Print first: the terminal/journal line is the record, and a
+                # slow or broken notification daemon must never delay or
+                # suppress it.
+                write_line(event)
+                notifier.notify_event(event)
+
         engine = AutoSwitchEngine(
             switcher,
             settings,
-            jsonl_emit if args.json else human_emit,
+            emit,
             dry_run=args.dry_run,
         )
 
@@ -731,6 +750,152 @@ Defaults live in settings.json in the backup root; flags override them.
             file=sys.stderr if args.json else sys.stdout,
         )
         sys.exit(130)
+
+
+def _service_command(argv: list[str]) -> None:
+    """Handle `cswap service [status|install|uninstall|enable|disable]`.
+
+    Pre-dispatched before the main parser is built, like `run`, `auto`, and
+    `config`. Manages the systemd **user** unit that runs `cswap auto` in the
+    background — see service.py. Nothing here needs root.
+    """
+    from claude_swap import service
+    from claude_swap.printer import accent
+
+    parser = argparse.ArgumentParser(
+        prog="cswap service",
+        description=(
+            "Run the auto-switcher in the background as a systemd user "
+            "service, so it keeps switching without a terminal open. "
+            "Linux only."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap service enable            # install, start now, and start at login
+  cswap service                   # what is it doing? (same as status)
+  cswap service disable           # stop now and at login
+  cswap service uninstall         # stop and remove the unit entirely
+
+Logs go to the journal:
+  journalctl --user -u claude-swap.service -f
+
+The service runs `cswap auto`, so it obeys the same settings — change them
+with `cswap config set autoswitch.threshold 80` and restart the service.
+        """,
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON to stdout (with status)",
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    sub = parser.add_subparsers(
+        dest="action", metavar="{status,install,uninstall,enable,disable}"
+    )
+    p_status = sub.add_parser("status", help="Show service state (the default)")
+    p_status.add_argument(
+        "--json",
+        action="store_true",
+        default=argparse.SUPPRESS,  # see _config_command: don't clobber a pre-verb --json
+        help="Emit machine-readable JSON to stdout",
+    )
+    sub.add_parser("install", help="Write the unit file (does not start it)")
+    sub.add_parser("uninstall", help="Stop, disable, and remove the unit file")
+    sub.add_parser("enable", help="Start now and at every login")
+    sub.add_parser("disable", help="Stop now and at every login")
+
+    args = parser.parse_args(argv)
+    json_mode = bool(getattr(args, "json", False))
+    action = args.action or "status"
+    if json_mode and action != "status":
+        parser.error("--json can only be used with status")
+
+    try:
+        if action == "install":
+            if service.install():
+                print(f"{accent('Installed')} {service.unit_path()}")
+                print(dimmed("Start it with: cswap service enable"))
+            else:
+                print(muted("Unit file is already up to date; nothing to do"))
+        elif action == "uninstall":
+            if service.uninstall():
+                print(f"{accent('Removed')} the claude-swap service")
+            else:
+                print(
+                    muted("The service is not installed; nothing to do"),
+                    file=sys.stderr,
+                )
+        elif action == "enable":
+            service.enable()
+            print(f"{accent('Auto-switch is running')} and will start at login")
+            print(dimmed("Follow it with: journalctl --user -u claude-swap.service -f"))
+        elif action == "disable":
+            service.disable()
+            print(f"{accent('Stopped')} the claude-swap service")
+        else:
+            _print_service_status(service.status(), json_mode=json_mode)
+    except ClaudeSwitchError as e:
+        if json_mode:
+            print(json.dumps(error_envelope(e), indent=2))
+        else:
+            error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
+def _print_service_status(status, *, json_mode: bool) -> None:
+    """Render `cswap service status` for humans or for scripts."""
+    from claude_swap import service
+    from claude_swap.printer import accent, bolded, yellowed
+
+    if json_mode:
+        print(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "unit": service.UNIT_NAME,
+                    "unitPath": str(status.unit_path),
+                    "installed": status.installed,
+                    "enabled": status.enabled,
+                    "active": status.active,
+                    "execStart": status.exec_start,
+                    "lingering": status.lingering,
+                },
+                indent=2,
+            )
+        )
+        return
+
+    print(bolded(service.UNIT_NAME))
+    if not status.installed:
+        print(f"  {'installed':<10}{yellowed('no')}")
+        print(dimmed("\nInstall and start it with: cswap service enable"))
+        print(dimmed("(or 'cswap service install' to write the unit only)"))
+        return
+
+    def mark(on: bool, yes: str, no: str) -> str:
+        return accent(yes) if on else yellowed(no)
+
+    print(f"  {'unit':<10}{status.unit_path}")
+    print(f"  {'command':<10}{status.exec_start or '?'}")
+    print(f"  {'enabled':<10}{mark(status.enabled, 'yes', 'no')}  {dimmed('(at login)')}")
+    print(f"  {'active':<10}{mark(status.active, 'yes', 'no')}  {dimmed('(right now)')}")
+    if status.lingering is False:
+        # The single most confusing way for this feature to "not work": the
+        # service is enabled and correct, and still stops the moment the last
+        # session ends. Say so before it happens.
+        print(
+            "\n"
+            + yellowed("Note:")
+            + " user services stop when your last session ends.\n"
+            + dimmed("     To keep switching while logged out, run:\n")
+            + f"       loginctl enable-linger {service.current_user() or '$USER'}"
+        )
+    if not status.active:
+        print(dimmed("\nStart it with: cswap service enable"))
 
 
 def _config_command(argv: list[str]) -> None:
@@ -929,6 +1094,9 @@ def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "config":
         _config_command(sys.argv[2:])
         return
+    if argv and argv[0] == "service":
+        _service_command(argv[1:])
+        return
     if argv and argv[0] == "map":
         _map_command(argv[1:])
         return
@@ -986,6 +1154,7 @@ Commands:
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
+  %(prog)s service [enable|status]    run auto-switch in the background (Linux)
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts

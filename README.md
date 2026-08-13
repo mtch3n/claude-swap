@@ -106,6 +106,8 @@ cswap auto --strategy consume-first   # burn the soonest-resetting account first
 - By default only the account-wide 5h/7d windows drive switching. If you work on one model and hit its **weekly per-model limit** first (e.g. Fable), add `--model Fable` (or `cswap config set autoswitch.model Fable`) to fold that model's window into the decision, so it switches off an account whose model quota is spent even while its 5h/7d windows still have room.
   - **Model names** are Anthropic's own per-model `display_name`s, matched case-insensitively. The exact strings for your accounts are the per-model rows in `cswap list` (e.g. a line reading `Fable: 100%`).
 
+On Linux, `cswap service enable` runs this loop as a [systemd user service](#background-service-linux) so it survives closing your terminal, and `cswap config set notifications.enabled true` puts [switches and problems on your desktop](#desktop-notifications-linux).
+
 For cron/systemd timers, `--once` reports the outcome in its exit code (`0` switched, `1` error, `2` nothing to do, `3` blocked — no viable target), and `--json` emits one JSON event per line:
 
 ```bash
@@ -178,6 +180,8 @@ This will update the stored credentials without creating a duplicate.
 ```bash
 cswap run 2                     # Run an account in this terminal only (session mode)
 cswap auto                      # Auto-switch when nearing rate limits (see above)
+cswap service enable            # Run auto-switch in the background, at login (Linux/systemd)
+cswap service                   # Show background service state
 cswap config                    # Show or edit settings (see Configuration below)
 cswap list                      # Show all accounts with 5h/7d usage and reset times
 cswap list --token-status       # Add source-labelled OAuth token diagnostics
@@ -245,6 +249,60 @@ Shows every account's 5h / 7d / spend usage and switches with a click (specific 
 
 </details>
 
+## Background service (Linux)
+
+Run the auto-switcher as a systemd **user** service, so it keeps switching without a terminal open — the Linux counterpart to the macOS menu bar's auto-switch:
+
+```bash
+cswap service enable       # install, start now, and start at every login
+cswap service              # what is it doing? (same as: cswap service status)
+cswap service disable      # stop now and at login
+cswap service uninstall    # stop and remove the unit entirely
+```
+
+<details>
+<summary>How it behaves & advanced usage</summary>
+
+- The unit runs `cswap auto`, so it obeys your `autoswitch.*` [settings](#configuration) — change one with `cswap config set autoswitch.threshold 80`, then `cswap service enable` to restart it.
+- Everything is **user-scoped**: no root, no sudo, no system unit. The unit lands in `~/.config/systemd/user/claude-swap.service` (or `$XDG_CONFIG_HOME`).
+- `enable` also starts it, and `disable` also stops it — systemd's enabled-at-login / running-now distinction isn't what you mean when you turn your account switcher on.
+- Logs go to the journal: `journalctl --user -u claude-swap.service -f`. Stopping is graceful — the loop handles SIGTERM, so a stop never lands mid-switch.
+- **User services stop when your last session ends.** To keep switching while logged out (a headless box, a server you SSH into), run `loginctl enable-linger $USER`. `cswap service status` tells you when this applies rather than leaving you to discover it.
+- If you set `CLAUDE_CONFIG_DIR` or `XDG_DATA_HOME` in your shell, those values are baked into the unit at install time — systemd doesn't read your shell profile, and without this the service would quietly use a different account store than your CLI.
+- `cswap service install` writes the unit without starting it; re-running it after switching installers (uv ↔ pipx) repoints the unit at the new binary.
+- `cswap service status --json` reports `installed` / `enabled` / `active` / `execStart` / `lingering` for scripting. The [TUI](#interactive-dashboard-tui) watch screen also shows a `SERVICE: ON/OFF` badge, so you can tell at a glance whether something is switching for you in the background.
+
+Not systemd, or not Linux? Run `cswap auto` under whatever supervisor you use, or `cswap auto --once` from a cron line — see [Automatic switching](#automatic-switching).
+
+</details>
+
+## Desktop notifications (Linux)
+
+Get a desktop notification when the auto-switcher does something you'd want to know about. Off until you turn it on:
+
+```bash
+cswap config set notifications.enabled true
+```
+
+<details>
+<summary>What you'll be told about</summary>
+
+Four events, all rare and all actionable — no per-poll noise:
+
+| Event | Why it interrupts you |
+|---|---|
+| Switched account | Your active account changed under you |
+| Account quarantined | An account's refresh token died and needs a re-login |
+| All accounts exhausted | Nothing left to switch to; it's waiting for a reset |
+| Configuration warning | e.g. an `autoswitch.model` name no account reports |
+
+- Applies to `cswap auto` however you run it — foreground, or the [background service](#background-service-linux).
+- Delivered with `notify-send` (libnotify), which every mainstream desktop already has. If it's missing, install it (`libnotify-bin` on Debian/Ubuntu, `libnotify` on Arch/Fedora); until then claude-swap logs a warning and carries on without notifications.
+- Repeats are suppressed for 15 minutes, so an exhausted fleet can't turn into a stream of popups.
+- macOS already gets these through the [menu bar](#menu-bar-macos); this is the Linux equivalent.
+
+</details>
+
 ## Advanced
 
 ### Configuration
@@ -259,6 +317,7 @@ cswap config                              # list effective settings ("(default)"
 cswap config get autoswitch.threshold
 cswap config set autoswitch.threshold 80  # validated: rejects out-of-range values loudly
 cswap config set autoswitch.model Fable   # per-model switching (see "auto"); Fable,Opus for several
+cswap config set notifications.enabled true  # desktop notifications on Linux
 cswap config unset autoswitch.threshold   # back to the default
 cswap config path                         # where settings.json lives
 ```

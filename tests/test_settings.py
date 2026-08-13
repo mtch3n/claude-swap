@@ -15,8 +15,10 @@ from claude_swap.settings import (
     SETTING_SPECS,
     atomic_write_json,
     AutoSwitchSettings,
+    NotificationSettings,
     UiSettings,
     effective_settings,
+    load_notification_settings,
     load_settings,
     load_ui_settings,
     merged_with_cli,
@@ -152,6 +154,46 @@ class TestUiSettings:
             set_setting(tmp_path, "ui.theme", "purple")
 
 
+class TestNotificationSettings:
+    def test_default_is_off(self, tmp_path: Path):
+        """Opt-in: an upgrade must never start popping up notifications."""
+        assert load_notification_settings(tmp_path) == NotificationSettings(enabled=False)
+
+    def test_reads_enabled(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"notifications": {"enabled": True}})
+        )
+        assert load_notification_settings(tmp_path).enabled is True
+
+    def test_corrupt_file_defaults_to_off(self, tmp_path: Path):
+        settings_path(tmp_path).write_text("{not json")
+        assert load_notification_settings(tmp_path).enabled is False
+
+    def test_non_bool_value_defaults_to_off(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"notifications": {"enabled": "yes please"}})
+        )
+        assert load_notification_settings(tmp_path).enabled is False
+
+    def test_set_and_unset(self, tmp_path: Path):
+        assert set_setting(tmp_path, "notifications.enabled", "true") is True
+        raw = json.loads(settings_path(tmp_path).read_text())
+        assert raw == {"schemaVersion": 1, "notifications": {"enabled": True}}
+        assert load_notification_settings(tmp_path).enabled is True
+        assert unset_setting(tmp_path, "notifications.enabled") is True
+        assert load_notification_settings(tmp_path).enabled is False
+
+    def test_set_rejects_non_bool(self, tmp_path: Path):
+        with pytest.raises(ConfigError, match="true or false"):
+            set_setting(tmp_path, "notifications.enabled", "maybe")
+
+    def test_coexists_with_other_sections(self, tmp_path: Path):
+        set_setting(tmp_path, "autoswitch.threshold", "80")
+        set_setting(tmp_path, "notifications.enabled", "true")
+        assert load_settings(tmp_path).threshold == 80.0
+        assert load_notification_settings(tmp_path).enabled is True
+
+
 class TestSettingSpecs:
     def test_registry_covers_every_dataclass_field(self):
         by_section: dict[str, set[str]] = {}
@@ -163,9 +205,16 @@ class TestSettingSpecs:
         assert by_section["ui"] == {
             f.name for f in UiSettings.__dataclass_fields__.values()
         }
+        assert by_section["notifications"] == {
+            f.name for f in NotificationSettings.__dataclass_fields__.values()
+        }
 
     def test_defaults_match_dataclass(self):
-        sources = {"autoswitch": AutoSwitchSettings(), "ui": UiSettings()}
+        sources = {
+            "autoswitch": AutoSwitchSettings(),
+            "ui": UiSettings(),
+            "notifications": NotificationSettings(),
+        }
         for spec in SETTING_SPECS.values():
             assert spec.default == getattr(sources[spec.section], spec.field)
 

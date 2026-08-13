@@ -16,6 +16,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -1324,6 +1325,21 @@ def fake_engine(monkeypatch):
     return _FakeEngine
 
 
+def _service_status(*, installed: bool = True, active: bool = True):
+    from pathlib import Path as _Path
+
+    from claude_swap.service import ServiceStatus
+
+    return ServiceStatus(
+        installed=installed,
+        enabled=active,
+        active=active,
+        unit_path=_Path("/home/u/.config/systemd/user/claude-swap.service"),
+        exec_start="/home/u/.local/bin/cswap auto" if installed else None,
+        lingering=True,
+    )
+
+
 @pytest.mark.asyncio
 class TestAutoScreen:
     async def _open(self, pilot):
@@ -1423,6 +1439,65 @@ class TestAutoScreen:
             # leaving the screen reverts the tick and unpins poll planning
             assert app.threshold_pct == 90.0
             assert fake._poll_inputs_override is None
+
+    async def _service_badge(self, pilot, status):
+        """Open the auto screen with service.status() stubbed; return the badge."""
+        from textual.widgets import Static
+
+        with patch("claude_swap.service.status", return_value=status):
+            await self._open(pilot)
+            await settle(pilot)
+        return pilot.app.screen.query_one("#service-badge", Static)
+
+    async def test_background_service_shown_when_running(self, tmp_path, fake_engine):
+        """The screen's own engine is dry-run; the badge is how you tell that
+        something IS switching for you in the background."""
+        fake = FakeSwitcher([make_account(1, active=True), make_account(2)], tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            badge = await self._service_badge(pilot, _service_status(active=True))
+            assert badge.display is True
+            assert "SERVICE" in badge.render().plain
+
+    async def test_installed_but_stopped_service_is_shown_too(
+        self, tmp_path, fake_engine
+    ):
+        fake = FakeSwitcher([make_account(1, active=True), make_account(2)], tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            badge = await self._service_badge(pilot, _service_status(active=False))
+            assert badge.display is True
+            assert "OFF" in badge.render().plain
+
+    async def test_no_badge_when_the_service_is_not_installed(
+        self, tmp_path, fake_engine
+    ):
+        """Most users never install it; they should never see this."""
+        fake = FakeSwitcher([make_account(1, active=True), make_account(2)], tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            badge = await self._service_badge(
+                pilot, _service_status(installed=False, active=False)
+            )
+            assert badge.display is False
+
+    async def test_service_probe_failure_never_breaks_the_screen(
+        self, tmp_path, fake_engine
+    ):
+        fake = FakeSwitcher([make_account(1, active=True), make_account(2)], tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            from textual.widgets import Static
+
+            with patch(
+                "claude_swap.service.status", side_effect=OSError("no systemd here")
+            ):
+                await self._open(pilot)
+                await settle(pilot)
+            from claude_swap.tui.autoview import AutoScreen
+
+            assert isinstance(app.screen, AutoScreen)
+            assert app.screen.query_one("#service-badge", Static).display is False
 
     async def test_threshold_adjust_escape_exits_mode_not_screen(
         self, tmp_path, fake_engine
