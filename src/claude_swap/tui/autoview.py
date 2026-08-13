@@ -48,6 +48,11 @@ _EVENT_ROLES = {
 }
 _QUIET_KINDS = {"poll", "no-switch", "sleep", "account-unquarantined"}
 
+# How often to re-read the background service's state. Slow on purpose: it
+# only changes when the user runs `cswap service` or systemd restarts the
+# unit, and each probe is a subprocess.
+SERVICE_PROBE_INTERVAL_S = 15.0
+
 
 def event_text(event: AutoSwitchEvent, *, palette: Palette = Palette.DARK) -> Text:
     """Log line for one engine event, styled like the CLI's human renderer."""
@@ -92,6 +97,11 @@ class AutoScreen(Screen):
         with Vertical(id="auto-top"):
             with Horizontal(id="auto-title-row"):
                 yield Static(" DRY-RUN ", id="mode-badge", classes="dry")
+                # Hidden until the probe finds an installed unit: most users
+                # never install the service and shouldn't see a badge about it.
+                service_badge = Static("", id="service-badge")
+                service_badge.display = False
+                yield service_badge
                 yield Static("", id="auto-summary")
             yield Static("", id="candidates")
         yield RichLog(id="event-log", highlight=False, markup=False, wrap=True)
@@ -112,6 +122,8 @@ class AutoScreen(Screen):
         self.watch(self.app, "snapshot", self._on_snapshot)
         self.watch(self.app, "theme", self._on_theme_change)
         self._start_engine(dry_run=True)
+        self._probe_service()
+        self.set_interval(SERVICE_PROBE_INTERVAL_S, self._probe_service)
 
     def on_unmount(self) -> None:
         if self._engine is not None:
@@ -281,6 +293,52 @@ class AutoScreen(Screen):
         else:
             badge.update(" DRY-RUN ")
             badge.set_classes("dry")
+
+    # -- background service ---------------------------------------------------
+
+    def _probe_service(self) -> None:
+        """Refresh the background-service badge off the UI thread.
+
+        This screen's own engine opens in dry-run, so without this the screen
+        looks like a live switcher while the thing actually switching accounts
+        — the systemd service — is invisible. Reading it shells out to
+        systemctl, hence the thread worker.
+        """
+        self.run_worker(
+            self._read_service_status,
+            thread=True,
+            group="service-probe",
+            exit_on_error=False,
+            name="service-probe",
+        )
+
+    def _read_service_status(self) -> None:
+        """Worker body: query the service, hand the answer to the UI thread."""
+        from claude_swap import service
+
+        try:
+            status = service.status()
+        except Exception:
+            status = None  # no systemd, no logind, not Linux — just hide it
+        try:
+            self.app.call_from_thread(self._apply_service_status, status)
+        except Exception:
+            pass  # screen tearing down; nothing to update
+
+    def _apply_service_status(self, status) -> None:
+        if not self.is_attached:
+            return
+        badge = self.query_one("#service-badge", Static)
+        if status is None or not status.installed:
+            badge.display = False
+            return
+        badge.display = True
+        if status.active:
+            badge.update(" SERVICE: ON ")
+            badge.set_classes("service-on")
+        else:
+            badge.update(" SERVICE: OFF ")
+            badge.set_classes("service-off")
 
     # -- candidates -----------------------------------------------------------
 

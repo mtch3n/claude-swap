@@ -67,7 +67,23 @@ class UiSettings:
     theme: str = "auto"
 
 
-_SECTION_DEFAULT_SOURCES = {"autoswitch": AutoSwitchSettings, "ui": UiSettings}
+@dataclass(frozen=True)
+class NotificationSettings:
+    """Desktop notification preferences (``notifications`` section).
+
+    Off by default: an upgrade must never start interrupting someone who
+    didn't ask for it. When on, ``cswap auto`` raises a desktop notification
+    for the four events worth interrupting for — see ``notify.py``.
+    """
+
+    enabled: bool = False
+
+
+_SECTION_DEFAULT_SOURCES = {
+    "autoswitch": AutoSwitchSettings,
+    "ui": UiSettings,
+    "notifications": NotificationSettings,
+}
 
 
 @dataclass(frozen=True)
@@ -138,6 +154,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
             help="Color theme; auto follows the terminal background",
+        ),
+        SettingSpec(
+            "notifications", "enabled", "enabled", "bool",
+            help="Desktop notifications for switches and problems (Linux)",
         ),
     )
 }
@@ -246,6 +266,29 @@ def load_ui_settings(backup_root: Path) -> UiSettings:
         )
         return default
     return UiSettings(theme=theme)
+
+
+def load_notification_settings(backup_root: Path) -> NotificationSettings:
+    """Load the notifications section; anything but a real ``true`` is off.
+
+    Deliberately strict about the type (no truthiness): a hand-edited
+    ``"enabled": "no"`` reading as on would be the worst possible failure
+    mode for a feature whose whole point is interrupting the user.
+    """
+    raw = _read_raw(settings_path(backup_root))
+    section = raw.get("notifications")
+    default = NotificationSettings()
+    if not isinstance(section, dict):
+        return default
+    enabled = section.get("enabled", default.enabled)
+    if not isinstance(enabled, bool):
+        _logger.warning(
+            "settings.json: notifications.enabled must be true or false, got %r; "
+            "notifications stay off",
+            enabled,
+        )
+        return default
+    return NotificationSettings(enabled=enabled)
 
 
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
@@ -412,6 +455,7 @@ def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, boo
     loaded = {
         "autoswitch": load_settings(backup_root),
         "ui": load_ui_settings(backup_root),
+        "notifications": load_notification_settings(backup_root),
     }
     rows = []
     for spec in SETTING_SPECS.values():
