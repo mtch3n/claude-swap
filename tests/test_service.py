@@ -88,10 +88,11 @@ class TestExecutableResolution:
         with patch.object(service.shutil, "which", return_value=None):
             assert service.exec_start() == f"{venv_bin / 'cswap'} auto"
 
-    def test_last_resort_runs_the_module(self, monkeypatch):
-        monkeypatch.setattr(sys, "executable", "/usr/bin/python3")
+    def test_last_resort_runs_the_module(self, tmp_path, monkeypatch):
+        python = str(tmp_path / "python3")
+        monkeypatch.setattr(sys, "executable", python)
         with patch.object(service.shutil, "which", return_value=None):
-            assert service.exec_start() == "/usr/bin/python3 -m claude_swap auto"
+            assert service.exec_start() == f"{python} -m claude_swap auto"
 
     def test_exec_start_is_absolute(self, linux_systemd):
         """A unit file gets no PATH lookup — a bare name would never start."""
